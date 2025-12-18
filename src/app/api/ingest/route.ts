@@ -1,8 +1,6 @@
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
 
-// Initialize Admin Client for DB writes (bypassing RLS for the initial insert if needed)
-// or use the standard client if you set up RLS policies correctly.
 const supabaseAdmin = createClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!
@@ -10,21 +8,27 @@ const supabaseAdmin = createClient(
 
 export async function POST(req: Request) {
     try {
-        // 1. Parse the Request
-        const { repoUrl, userId } = await req.json();
+        // 1. Parse Request (Added startCommand)
+        const { repoUrl, userId, startCommand } = await req.json();
 
         if (!repoUrl || !repoUrl.startsWith('https://github.com/')) {
             return NextResponse.json({ error: 'Invalid GitHub URL' }, { status: 400 });
         }
 
+        if (!startCommand) {
+            return NextResponse.json({ error: 'Start command is required (e.g., "node index.js")' }, { status: 400 });
+        }
+
         console.log(`[Ingest] Starting ingestion for: ${repoUrl}`);
 
-        // 2. Insert into "Waiting Room" (Supabase)
+        // 2. Insert into DB (Added start_command)
+        // Make sure you ran the SQL to add the 'start_command' column!
         const { data: tool, error: dbError } = await supabaseAdmin
             .from('tools')
             .insert({
-                user_id: userId, // In a real app, verify this with auth.getUser()
+                user_id: userId,
                 repo_url: repoUrl,
+                start_command: startCommand, // <--- Saving to DB
                 status: 'pending'
             })
             .select()
@@ -35,7 +39,7 @@ export async function POST(req: Request) {
             return NextResponse.json({ error: 'Database Insert Failed' }, { status: 500 });
         }
 
-        // 3. Trigger GitHub Action (The "Dispatch")
+        // 3. Trigger GitHub Action (Pass start_command in payload)
         const [owner, repo] = process.env.GITHUB_PLATFORM_REPO!.split('/');
 
         const githubResponse = await fetch(
@@ -48,10 +52,11 @@ export async function POST(req: Request) {
                     'User-Agent': 'mcp-platform-ingestor',
                 },
                 body: JSON.stringify({
-                    event_type: 'ingest_tool', // This MUST match the yaml file later
+                    event_type: 'ingest_tool',
                     client_payload: {
-                        tool_id: tool.id,        // Pass ID so the worker knows what to update
-                        repo_url: repoUrl
+                        tool_id: tool.id,
+                        repo_url: repoUrl,
+                        start_command: startCommand // <--- Passing to GitHub Action
                     }
                 })
             }

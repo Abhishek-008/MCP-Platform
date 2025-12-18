@@ -2,32 +2,39 @@ name: Ingest MCP Tool
 
 on:
   repository_dispatch:
-    types: [ingest_tool] # Matches the 'event_type' in your API route
+    types: [ingest_tool]
 
 jobs:
-  build-and-bundle:
+  build-and-inspect:
     runs-on: ubuntu-latest
     steps:
-      # 1. Checkout YOUR platform code (to get the builder scripts)
+      # 1. Checkout YOUR platform code
       - name: Checkout Platform
         uses: actions/checkout@v4
 
-      # 2. Setup Node.js
+      # 2. Setup Node.js (for Builder script AND Node-based MCP servers)
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      # 3. Install Dependencies (for your builder script)
+      # 3. Setup Python (New Requirement for Python-based MCP servers)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10' 
+
+      # 4. Install Platform Dependencies (tsx, esbuild, etc.)
       - name: Install Platform Deps
         run: npm ci
 
-      # 4. Run the Builder Script
-      # We pass the inputs from the API Payload as Environment Variables
-      - name: Run Builder
+      # 5. Run the Inspector Script
+      # We add START_CMD to the environment variables here
+      - name: Run Inspector
         env:
           SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           TOOL_ID: ${{ github.event.client_payload.tool_id }}
           TARGET_REPO_URL: ${{ github.event.client_payload.repo_url }}
-        run: npx tsx scripts/builder.ts
+          START_CMD: ${{ github.event.client_payload.start_command }}  # <--- NEW
+        run: npx tsx scripts/inspector.ts
