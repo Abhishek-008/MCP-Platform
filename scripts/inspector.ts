@@ -7,11 +7,9 @@ import path from 'path';
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_KEY!);
 const TOOL_ID = process.env.TOOL_ID!;
 const REPO_URL = process.env.TARGET_REPO_URL!;
-const START_CMD = process.env.START_CMD!; // <--- New Input from User
+const START_CMD = process.env.START_CMD!;
 
 const workDir = path.resolve('./temp_repo');
-
-
 
 async function main() {
     try {
@@ -21,77 +19,104 @@ async function main() {
         if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true });
         execSync(`git clone ${REPO_URL} ${workDir}`);
 
-        // 2. Detect Type & Install Dependencies
-        console.log('[Inspector] Detecting project type...');
+        // 2. UNIVERSAL INSTALLER LOGIC
+        console.log('[Inspector] Detecting project type and installing dependencies...');
 
-        // NODE.JS STRATEGY
+        // --- STRATEGY: NODE.JS ---
         if (fs.existsSync(path.join(workDir, 'package.json'))) {
             console.log('-> Detected Node.js project');
 
+            // Check for Lockfiles to determine Package Manager
             if (fs.existsSync(path.join(workDir, 'pnpm-lock.yaml'))) {
                 console.log('   Using pnpm...');
                 execSync('npm install -g pnpm', { stdio: 'inherit' });
-                execSync('pnpm install --prod', { cwd: workDir, stdio: 'inherit' });
-            } else if (fs.existsSync(path.join(workDir, 'yarn.lock'))) {
+                execSync('pnpm install', { cwd: workDir, stdio: 'inherit' });
+            }
+            else if (fs.existsSync(path.join(workDir, 'yarn.lock'))) {
                 console.log('   Using yarn...');
-                execSync('yarn install --production', { cwd: workDir, stdio: 'inherit' });
-            } else {
+                // --non-interactive prevents hanging on prompts
+                execSync('yarn install --non-interactive', { cwd: workDir, stdio: 'inherit' });
+            }
+            else if (fs.existsSync(path.join(workDir, 'bun.lockb'))) {
+                console.log('   Using bun...');
+                execSync('npm install -g bun', { stdio: 'inherit' });
+                execSync('bun install', { cwd: workDir, stdio: 'inherit' });
+            }
+            else {
                 console.log('   Using npm...');
-                execSync('npm ci --omit=dev', { cwd: workDir, stdio: 'inherit' });
+                // Use 'install' instead of 'ci' to be more forgiving of broken lockfiles
+                execSync('npm install', { cwd: workDir, stdio: 'inherit' });
             }
 
-            // Build step (if needed)
+            // Auto-Build: If a build script exists, run it.
+            // Many MCP servers (like Gmail) are TypeScript and MUST be built.
             const pkg = JSON.parse(fs.readFileSync(path.join(workDir, 'package.json'), 'utf-8'));
             if (pkg.scripts && pkg.scripts.build) {
-                // Detect build system
-                const cmd = fs.existsSync(path.join(workDir, 'pnpm-lock.yaml')) ? 'pnpm' : 'npm';
-                execSync(`${cmd} run build`, { cwd: workDir, stdio: 'inherit' });
+                console.log('   Running build script...');
+                // Detect which runner to use again
+                const runner = fs.existsSync(path.join(workDir, 'pnpm-lock.yaml')) ? 'pnpm' :
+                    fs.existsSync(path.join(workDir, 'yarn.lock')) ? 'yarn' :
+                        fs.existsSync(path.join(workDir, 'bun.lockb')) ? 'bun' : 'npm';
+
+                execSync(`${runner} run build`, { cwd: workDir, stdio: 'inherit' });
             }
         }
-        // PYTHON STRATEGY
+
+        // --- STRATEGY: PYTHON ---
         else if (fs.existsSync(path.join(workDir, 'pyproject.toml')) || fs.existsSync(path.join(workDir, 'requirements.txt'))) {
             console.log('-> Detected Python project');
 
-            // Check for 'uv' usage (preferred for speed/reliability)
+            // Priority 1: UV (Fastest, modern standard)
             if (fs.existsSync(path.join(workDir, 'uv.lock'))) {
                 console.log('   Using uv...');
                 execSync('pip install uv', { stdio: 'inherit' });
                 execSync('uv sync', { cwd: workDir, stdio: 'inherit' });
-            } else {
-                // Fallback to standard pip
-                if (fs.existsSync(path.join(workDir, 'requirements.txt'))) {
-                    execSync('pip install -r requirements.txt', { cwd: workDir, stdio: 'inherit' });
-                }
+            }
+            // Priority 2: Poetry
+            else if (fs.existsSync(path.join(workDir, 'poetry.lock'))) {
+                console.log('   Using poetry...');
+                execSync('pip install poetry', { stdio: 'inherit' });
+                execSync('poetry install', { cwd: workDir, stdio: 'inherit' });
+            }
+            // Priority 3: Standard PIP
+            else {
+                // Install "build" dependencies if pyproject exists
                 if (fs.existsSync(path.join(workDir, 'pyproject.toml'))) {
+                    console.log('   Installing via pyproject.toml...');
                     execSync('pip install .', { cwd: workDir, stdio: 'inherit' });
+                }
+                // Fallback to requirements.txt
+                else if (fs.existsSync(path.join(workDir, 'requirements.txt'))) {
+                    console.log('   Installing via requirements.txt...');
+                    execSync('pip install -r requirements.txt', { cwd: workDir, stdio: 'inherit' });
                 }
             }
         }
+        else {
+            console.log('-> No standard project structure found. Attempting to run raw...');
+        }
 
-        // 3. INTROSPECTION (The Magic Step)
-        console.log(`[Inspector] Booting server with: "${START_CMD}" to extract tools...`);
+        // 3. INTROSPECTION (Handshake)
+        console.log(`[Inspector] Booting server with: "${START_CMD}"...`);
 
+        // We pass 'workDir' as CWD so the server finds its own files
         const tools = await fetchToolsFromRunningServer(START_CMD, workDir);
 
         console.log(`[Inspector] Successfully discovered ${tools.length} tools.`);
 
-        // 4. Create the "Golden Record" (Manifest)
+        // 4. Save to DB
         const manifest = {
             generated_at: new Date().toISOString(),
             source: REPO_URL,
             start_command: START_CMD,
-            tools: tools // We explicitly store the discovered tools
+            tools: tools
         };
 
-        // 5. Upload to DB
-        // Note: In a $0 build, we might just store the manifest and clone-on-demand at runtime 
-        // instead of creating a huge bundle artifact, unless you strictly need single-file bundles.
         await supabase
             .from('tools')
             .update({
                 status: 'active',
                 manifest: manifest,
-                // For now, we assume we just clone the repo at runtime since we support multiple languages
                 bundle_path: 'GIT_CLONE_MODE'
             })
             .eq('id', TOOL_ID);
@@ -105,90 +130,61 @@ async function main() {
     }
 }
 
-// Helper: Starts the server, sends "tools/list", and kills it.
+// --- HELPER: MCP Handshake ---
 function fetchToolsFromRunningServer(command: string, cwd: string): Promise<any[]> {
     return new Promise((resolve, reject) => {
         const [cmd, ...args] = command.split(' ');
 
         console.log(`[Inspector] Spawning: ${cmd} ${args.join(' ')}`);
-        const serverProcess = spawn(cmd, args, { cwd, env: process.env });
+
+        // Use 'shell: true' to support commands like "python -m ..." or chained commands
+        const serverProcess = spawn(cmd, args, { cwd, env: process.env, shell: true });
 
         let buffer = '';
         let isInitialized = false;
 
-        // Listen to STDOUT (Server responses)
         serverProcess.stdout.on('data', (data) => {
             buffer += data.toString();
-
-            // Process buffer line by line
             const lines = buffer.split('\n');
-            buffer = lines.pop() || ''; // Keep the last partial line in buffer
+            buffer = lines.pop() || '';
 
             for (const line of lines) {
                 if (!line.trim()) continue;
-
                 try {
                     const json = JSON.parse(line);
 
-                    // STEP 2: Receive Initialize Response
+                    // Step 2: Receive Initialize Response
                     if (json.id === 0 && json.result) {
-                        console.log('[Inspector] Handshake Step 2: Server initialized.');
-
-                        // STEP 3: Send "initialized" notification
-                        const initNotification = JSON.stringify({
-                            jsonrpc: "2.0",
-                            method: "notifications/initialized"
-                        }) + "\n";
+                        const initNotification = JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n";
                         serverProcess.stdin.write(initNotification);
 
-                        // STEP 4: Ask for Tools
-                        console.log('[Inspector] Handshake Step 4: Requesting tools...');
-                        const toolsRequest = JSON.stringify({
-                            jsonrpc: "2.0",
-                            id: 1,
-                            method: "tools/list"
-                        }) + "\n";
+                        const toolsRequest = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) + "\n";
                         serverProcess.stdin.write(toolsRequest);
                         isInitialized = true;
                     }
 
-                    // STEP 5: Receive Tools
+                    // Step 3: Receive Tools
                     if (json.id === 1 && json.result && json.result.tools) {
-                        console.log(`[Inspector] Success! Found ${json.result.tools.length} tools.`);
                         resolve(json.result.tools);
                         serverProcess.kill();
                     }
-
-                } catch (e) {
-                    // Ignore non-JSON lines (like logs)
-                }
+                } catch (e) { }
             }
         });
 
-        // Listen to STDERR (Debugging)
         serverProcess.stderr.on('data', (data) => console.error(`[Server Log] ${data}`));
 
-        // STEP 1: Send Initialize Request immediately
-        console.log('[Inspector] Handshake Step 1: Sending initialize...');
+        // Step 1: Send Initialize
         const initRequest = JSON.stringify({
-            jsonrpc: "2.0",
-            id: 0,
-            method: "initialize",
-            params: {
-                protocolVersion: "2024-11-05",
-                capabilities: {},
-                clientInfo: { name: "mcp-inspector", version: "1.0.0" }
-            }
+            jsonrpc: "2.0", id: 0, method: "initialize",
+            params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "inspector", version: "1.0" } }
         }) + "\n";
         serverProcess.stdin.write(initRequest);
 
-        // Timeout Safety (10 seconds)
         setTimeout(() => {
             serverProcess.kill();
-            reject(new Error("Timeout: Server did not complete handshake within 10s"));
-        }, 10000);
-
-        serverProcess.on('error', (err) => reject(new Error(`Failed to start process: ${err.message}`)));
+            reject(new Error("Timeout: Handshake failed (15s)"));
+        }, 15000);
     });
 }
 
