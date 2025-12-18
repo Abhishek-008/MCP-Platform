@@ -1,0 +1,33 @@
+name: Ingest MCP Tool
+
+on:
+  repository_dispatch:
+    types: [ingest_tool] # Matches the 'event_type' in your API route
+
+jobs:
+  build-and-bundle:
+    runs-on: ubuntu-latest
+    steps:
+      # 1. Checkout YOUR platform code (to get the builder scripts)
+      - name: Checkout Platform
+        uses: actions/checkout@v4
+
+      # 2. Setup Node.js
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 3. Install Dependencies (for your builder script)
+      - name: Install Platform Deps
+        run: npm ci
+
+      # 4. Run the Builder Script
+      # We pass the inputs from the API Payload as Environment Variables
+      - name: Run Builder
+        env:
+          SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          TOOL_ID: ${{ github.event.client_payload.tool_id }}
+          TARGET_REPO_URL: ${{ github.event.client_payload.repo_url }}
+        run: npx tsx scripts/builder.ts
