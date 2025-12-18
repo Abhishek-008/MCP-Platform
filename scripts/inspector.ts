@@ -11,6 +11,8 @@ const START_CMD = process.env.START_CMD!; // <--- New Input from User
 
 const workDir = path.resolve('./temp_repo');
 
+
+
 async function main() {
     try {
         console.log(`[Inspector] Processing ${REPO_URL}...`);
@@ -99,29 +101,57 @@ function fetchToolsFromRunningServer(command: string, cwd: string): Promise<any[
     return new Promise((resolve, reject) => {
         const [cmd, ...args] = command.split(' ');
 
-        // Spawn the server process
+        console.log(`[Inspector] Spawning: ${cmd} ${args.join(' ')}`);
         const serverProcess = spawn(cmd, args, { cwd, env: process.env });
 
         let buffer = '';
-        let toolsFound = false;
+        let isInitialized = false;
 
         // Listen to STDOUT (Server responses)
         serverProcess.stdout.on('data', (data) => {
             buffer += data.toString();
 
-            // Try to parse JSON-RPC messages from the stream
+            // Process buffer line by line
             const lines = buffer.split('\n');
+            buffer = lines.pop() || ''; // Keep the last partial line in buffer
+
             for (const line of lines) {
+                if (!line.trim()) continue;
+
                 try {
                     const json = JSON.parse(line);
-                    // Check if this is the response to our request
-                    if (json.id === 1 && json.result && json.result.tools) {
-                        toolsFound = true;
-                        resolve(json.result.tools);
-                        serverProcess.kill(); // We got what we came for
+
+                    // STEP 2: Receive Initialize Response
+                    if (json.id === 0 && json.result) {
+                        console.log('[Inspector] Handshake Step 2: Server initialized.');
+
+                        // STEP 3: Send "initialized" notification
+                        const initNotification = JSON.stringify({
+                            jsonrpc: "2.0",
+                            method: "notifications/initialized"
+                        }) + "\n";
+                        serverProcess.stdin.write(initNotification);
+
+                        // STEP 4: Ask for Tools
+                        console.log('[Inspector] Handshake Step 4: Requesting tools...');
+                        const toolsRequest = JSON.stringify({
+                            jsonrpc: "2.0",
+                            id: 1,
+                            method: "tools/list"
+                        }) + "\n";
+                        serverProcess.stdin.write(toolsRequest);
+                        isInitialized = true;
                     }
+
+                    // STEP 5: Receive Tools
+                    if (json.id === 1 && json.result && json.result.tools) {
+                        console.log(`[Inspector] Success! Found ${json.result.tools.length} tools.`);
+                        resolve(json.result.tools);
+                        serverProcess.kill();
+                    }
+
                 } catch (e) {
-                    // Ignore partial JSON lines
+                    // Ignore non-JSON lines (like logs)
                 }
             }
         });
@@ -129,22 +159,25 @@ function fetchToolsFromRunningServer(command: string, cwd: string): Promise<any[
         // Listen to STDERR (Debugging)
         serverProcess.stderr.on('data', (data) => console.error(`[Server Log] ${data}`));
 
-        // Send the "listTools" request immediately after spawn
-        const request = JSON.stringify({
+        // STEP 1: Send Initialize Request immediately
+        console.log('[Inspector] Handshake Step 1: Sending initialize...');
+        const initRequest = JSON.stringify({
             jsonrpc: "2.0",
-            id: 1,
-            method: "tools/list"
-        }) + "\n"; // Newline is crucial for stdio transport!
-
-        serverProcess.stdin.write(request);
-
-        // Timeout Safety (5 seconds)
-        setTimeout(() => {
-            if (!toolsFound) {
-                serverProcess.kill();
-                reject(new Error("Timeout: Server did not respond to tools/list within 5s"));
+            id: 0,
+            method: "initialize",
+            params: {
+                protocolVersion: "2024-11-05",
+                capabilities: {},
+                clientInfo: { name: "mcp-inspector", version: "1.0.0" }
             }
-        }, 5000);
+        }) + "\n";
+        serverProcess.stdin.write(initRequest);
+
+        // Timeout Safety (10 seconds)
+        setTimeout(() => {
+            serverProcess.kill();
+            reject(new Error("Timeout: Server did not complete handshake within 10s"));
+        }, 10000);
 
         serverProcess.on('error', (err) => reject(new Error(`Failed to start process: ${err.message}`)));
     });
