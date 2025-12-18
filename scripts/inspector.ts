@@ -22,21 +22,37 @@ async function main() {
         // 2. Detect Type & Install Dependencies
         console.log('[Inspector] Installing dependencies...');
 
-        if (fs.existsSync(path.join(workDir, 'package.json'))) {
-            // Node.js Strategy
+        const packageJsonPath = path.join(workDir, 'package.json');
+        const requirementsPath = path.join(workDir, 'requirements.txt');
+        const pyprojectPath = path.join(workDir, 'pyproject.toml');
+
+        if (fs.existsSync(packageJsonPath)) {
+            // --- NODE.JS STRATEGY ---
             console.log('-> Detected Node.js project');
             execSync('npm install --production', { cwd: workDir, stdio: 'inherit' });
 
-            // Optional: Build if there is a build script
-            const pkg = JSON.parse(fs.readFileSync(path.join(workDir, 'package.json'), 'utf-8'));
+            const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
             if (pkg.scripts && pkg.scripts.build) {
                 execSync('npm run build', { cwd: workDir, stdio: 'inherit' });
             }
 
-        } else if (fs.existsSync(path.join(workDir, 'requirements.txt')) || fs.existsSync(path.join(workDir, 'pyproject.toml'))) {
-            // Python Strategy
+        } else if (fs.existsSync(requirementsPath) || fs.existsSync(pyprojectPath)) {
+            // --- PYTHON STRATEGY ---
             console.log('-> Detected Python project');
-            execSync('pip install -r requirements.txt', { cwd: workDir, stdio: 'inherit' });
+
+            // CASE A: Standard requirements.txt
+            if (fs.existsSync(requirementsPath)) {
+                console.log('   Installing via requirements.txt...');
+                execSync('pip install -r requirements.txt', { cwd: workDir, stdio: 'inherit' });
+            }
+
+            // CASE B: Modern pyproject.toml (No requirements.txt)
+            // We run "pip install ." which reads pyproject.toml and installs dependencies
+            else if (fs.existsSync(pyprojectPath)) {
+                console.log('   Installing via pyproject.toml...');
+                execSync('pip install .', { cwd: workDir, stdio: 'inherit' });
+            }
+
         } else {
             console.log('-> No standard dependency file found. Assuming standalone script.');
         }
