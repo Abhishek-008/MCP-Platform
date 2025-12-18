@@ -22,41 +22,50 @@ async function main() {
         execSync(`git clone ${REPO_URL} ${workDir}`);
 
         // 2. Detect Type & Install Dependencies
-        console.log('[Inspector] Installing dependencies...');
+        console.log('[Inspector] Detecting project type...');
 
-        const packageJsonPath = path.join(workDir, 'package.json');
-        const requirementsPath = path.join(workDir, 'requirements.txt');
-        const pyprojectPath = path.join(workDir, 'pyproject.toml');
-
-        if (fs.existsSync(packageJsonPath)) {
-            // --- NODE.JS STRATEGY ---
+        // NODE.JS STRATEGY
+        if (fs.existsSync(path.join(workDir, 'package.json'))) {
             console.log('-> Detected Node.js project');
-            execSync('npm install --production', { cwd: workDir, stdio: 'inherit' });
 
-            const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'));
-            if (pkg.scripts && pkg.scripts.build) {
-                execSync('npm run build', { cwd: workDir, stdio: 'inherit' });
+            if (fs.existsSync(path.join(workDir, 'pnpm-lock.yaml'))) {
+                console.log('   Using pnpm...');
+                execSync('npm install -g pnpm', { stdio: 'inherit' });
+                execSync('pnpm install --prod', { cwd: workDir, stdio: 'inherit' });
+            } else if (fs.existsSync(path.join(workDir, 'yarn.lock'))) {
+                console.log('   Using yarn...');
+                execSync('yarn install --production', { cwd: workDir, stdio: 'inherit' });
+            } else {
+                console.log('   Using npm...');
+                execSync('npm ci --omit=dev', { cwd: workDir, stdio: 'inherit' });
             }
 
-        } else if (fs.existsSync(requirementsPath) || fs.existsSync(pyprojectPath)) {
-            // --- PYTHON STRATEGY ---
+            // Build step (if needed)
+            const pkg = JSON.parse(fs.readFileSync(path.join(workDir, 'package.json'), 'utf-8'));
+            if (pkg.scripts && pkg.scripts.build) {
+                // Detect build system
+                const cmd = fs.existsSync(path.join(workDir, 'pnpm-lock.yaml')) ? 'pnpm' : 'npm';
+                execSync(`${cmd} run build`, { cwd: workDir, stdio: 'inherit' });
+            }
+        }
+        // PYTHON STRATEGY
+        else if (fs.existsSync(path.join(workDir, 'pyproject.toml')) || fs.existsSync(path.join(workDir, 'requirements.txt'))) {
             console.log('-> Detected Python project');
 
-            // CASE A: Standard requirements.txt
-            if (fs.existsSync(requirementsPath)) {
-                console.log('   Installing via requirements.txt...');
-                execSync('pip install -r requirements.txt', { cwd: workDir, stdio: 'inherit' });
+            // Check for 'uv' usage (preferred for speed/reliability)
+            if (fs.existsSync(path.join(workDir, 'uv.lock'))) {
+                console.log('   Using uv...');
+                execSync('pip install uv', { stdio: 'inherit' });
+                execSync('uv sync', { cwd: workDir, stdio: 'inherit' });
+            } else {
+                // Fallback to standard pip
+                if (fs.existsSync(path.join(workDir, 'requirements.txt'))) {
+                    execSync('pip install -r requirements.txt', { cwd: workDir, stdio: 'inherit' });
+                }
+                if (fs.existsSync(path.join(workDir, 'pyproject.toml'))) {
+                    execSync('pip install .', { cwd: workDir, stdio: 'inherit' });
+                }
             }
-
-            // CASE B: Modern pyproject.toml (No requirements.txt)
-            // We run "pip install ." which reads pyproject.toml and installs dependencies
-            else if (fs.existsSync(pyprojectPath)) {
-                console.log('   Installing via pyproject.toml...');
-                execSync('pip install .', { cwd: workDir, stdio: 'inherit' });
-            }
-
-        } else {
-            console.log('-> No standard dependency file found. Assuming standalone script.');
         }
 
         // 3. INTROSPECTION (The Magic Step)
