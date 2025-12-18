@@ -2,6 +2,7 @@ import { createClient } from '@supabase/supabase-js';
 import { execSync, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import archiver from 'archiver';
 
 // --- Configuration ---
 const supabase = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_KEY!);
@@ -10,6 +11,7 @@ const REPO_URL = process.env.TARGET_REPO_URL!;
 const START_CMD = process.env.START_CMD!;
 
 const workDir = path.resolve('./temp_repo');
+const artifactPath = path.resolve('./artifact.zip');
 
 async function main() {
     try {
@@ -17,94 +19,38 @@ async function main() {
 
         // 1. Clean & Clone
         if (fs.existsSync(workDir)) fs.rmSync(workDir, { recursive: true, force: true });
+        if (fs.existsSync(artifactPath)) fs.unlinkSync(artifactPath);
+
         execSync(`git clone ${REPO_URL} ${workDir}`);
 
-        // 2. UNIVERSAL INSTALLER LOGIC
-        console.log('[Inspector] Detecting project type and installing dependencies...');
+        // 2. Install Dependencies (Universal Logic)
+        installDependencies(workDir);
 
-        // --- STRATEGY: NODE.JS ---
-        if (fs.existsSync(path.join(workDir, 'package.json'))) {
-            console.log('-> Detected Node.js project');
-
-            // Check for Lockfiles to determine Package Manager
-            if (fs.existsSync(path.join(workDir, 'pnpm-lock.yaml'))) {
-                console.log('   Using pnpm...');
-                execSync('npm install -g pnpm', { stdio: 'inherit' });
-                execSync('pnpm install', { cwd: workDir, stdio: 'inherit' });
-            }
-            else if (fs.existsSync(path.join(workDir, 'yarn.lock'))) {
-                console.log('   Using yarn...');
-                // --non-interactive prevents hanging on prompts
-                execSync('yarn install --non-interactive', { cwd: workDir, stdio: 'inherit' });
-            }
-            else if (fs.existsSync(path.join(workDir, 'bun.lockb'))) {
-                console.log('   Using bun...');
-                execSync('npm install -g bun', { stdio: 'inherit' });
-                execSync('bun install', { cwd: workDir, stdio: 'inherit' });
-            }
-            else {
-                console.log('   Using npm...');
-                // Use 'install' instead of 'ci' to be more forgiving of broken lockfiles
-                execSync('npm install', { cwd: workDir, stdio: 'inherit' });
-            }
-
-            // Auto-Build: If a build script exists, run it.
-            // Many MCP servers (like Gmail) are TypeScript and MUST be built.
-            const pkg = JSON.parse(fs.readFileSync(path.join(workDir, 'package.json'), 'utf-8'));
-            if (pkg.scripts && pkg.scripts.build) {
-                console.log('   Running build script...');
-                // Detect which runner to use again
-                const runner = fs.existsSync(path.join(workDir, 'pnpm-lock.yaml')) ? 'pnpm' :
-                    fs.existsSync(path.join(workDir, 'yarn.lock')) ? 'yarn' :
-                        fs.existsSync(path.join(workDir, 'bun.lockb')) ? 'bun' : 'npm';
-
-                execSync(`${runner} run build`, { cwd: workDir, stdio: 'inherit' });
-            }
-        }
-
-        // --- STRATEGY: PYTHON ---
-        else if (fs.existsSync(path.join(workDir, 'pyproject.toml')) || fs.existsSync(path.join(workDir, 'requirements.txt'))) {
-            console.log('-> Detected Python project');
-
-            // Priority 1: UV (Fastest, modern standard)
-            if (fs.existsSync(path.join(workDir, 'uv.lock'))) {
-                console.log('   Using uv...');
-                execSync('pip install uv', { stdio: 'inherit' });
-                execSync('uv sync', { cwd: workDir, stdio: 'inherit' });
-            }
-            // Priority 2: Poetry
-            else if (fs.existsSync(path.join(workDir, 'poetry.lock'))) {
-                console.log('   Using poetry...');
-                execSync('pip install poetry', { stdio: 'inherit' });
-                execSync('poetry install', { cwd: workDir, stdio: 'inherit' });
-            }
-            // Priority 3: Standard PIP
-            else {
-                // Install "build" dependencies if pyproject exists
-                if (fs.existsSync(path.join(workDir, 'pyproject.toml'))) {
-                    console.log('   Installing via pyproject.toml...');
-                    execSync('pip install .', { cwd: workDir, stdio: 'inherit' });
-                }
-                // Fallback to requirements.txt
-                else if (fs.existsSync(path.join(workDir, 'requirements.txt'))) {
-                    console.log('   Installing via requirements.txt...');
-                    execSync('pip install -r requirements.txt', { cwd: workDir, stdio: 'inherit' });
-                }
-            }
-        }
-        else {
-            console.log('-> No standard project structure found. Attempting to run raw...');
-        }
-
-        // 3. INTROSPECTION (Handshake)
+        // 3. Introspection (Handshake)
         console.log(`[Inspector] Booting server with: "${START_CMD}"...`);
-
-        // We pass 'workDir' as CWD so the server finds its own files
         const tools = await fetchToolsFromRunningServer(START_CMD, workDir);
-
         console.log(`[Inspector] Successfully discovered ${tools.length} tools.`);
 
-        // 4. Save to DB
+        // 4. Packing (Create Zip)
+        console.log('[Inspector] Creating Snapshot Artifact...');
+        // We EXCLUDE node_modules to keep the zip small (under 50MB Supabase limit).
+        // The Gateway will run 'npm install' or 'pip install' again.
+        // This tradeoff is required for the Free Tier.
+        await createZipArtifact(workDir, artifactPath, ['node_modules', '.git', '.venv', '__pycache__']);
+
+        // 5. Upload to Supabase
+        console.log('[Inspector] Uploading Snapshot...');
+        const fileContent = fs.readFileSync(artifactPath);
+        const storagePath = `snapshots/${TOOL_ID}.zip`;
+
+        // Ensure bucket exists (or create it manually in dashboard if this fails)
+        const { error: uploadError } = await supabase.storage
+            .from('tool-bundles')
+            .upload(storagePath, fileContent, { contentType: 'application/zip', upsert: true });
+
+        if (uploadError) throw uploadError;
+
+        // 6. Update Database
         const manifest = {
             generated_at: new Date().toISOString(),
             source: REPO_URL,
@@ -117,7 +63,7 @@ async function main() {
             .update({
                 status: 'active',
                 manifest: manifest,
-                bundle_path: 'GIT_CLONE_MODE'
+                bundle_path: storagePath
             })
             .eq('id', TOOL_ID);
 
@@ -130,14 +76,58 @@ async function main() {
     }
 }
 
-// --- HELPER: MCP Handshake ---
+// ---------------- HELPER FUNCTIONS ----------------
+
+function installDependencies(cwd: string) {
+    console.log('[Inspector] Detecting project type...');
+
+    // NODE.JS
+    if (fs.existsSync(path.join(cwd, 'package.json'))) {
+        console.log('-> Detected Node.js project');
+
+        if (fs.existsSync(path.join(cwd, 'pnpm-lock.yaml'))) {
+            execSync('npm install -g pnpm', { stdio: 'inherit' });
+            execSync('pnpm install', { cwd, stdio: 'inherit' });
+        }
+        else if (fs.existsSync(path.join(cwd, 'yarn.lock'))) {
+            execSync('yarn install --frozen-lockfile', { cwd, stdio: 'inherit' });
+        }
+        else {
+            execSync('npm install', { cwd, stdio: 'inherit' });
+        }
+
+        // Build Step
+        const pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf-8'));
+        if (pkg.scripts && pkg.scripts.build) {
+            console.log('   Running build script...');
+            const runner = fs.existsSync(path.join(cwd, 'pnpm-lock.yaml')) ? 'pnpm' :
+                fs.existsSync(path.join(cwd, 'yarn.lock')) ? 'yarn' : 'npm';
+            execSync(`${runner} run build`, { cwd, stdio: 'inherit' });
+        }
+    }
+    // PYTHON
+    else if (fs.existsSync(path.join(cwd, 'pyproject.toml')) || fs.existsSync(path.join(cwd, 'requirements.txt'))) {
+        console.log('-> Detected Python project');
+
+        if (fs.existsSync(path.join(cwd, 'uv.lock'))) {
+            execSync('pip install uv', { stdio: 'inherit' });
+            execSync('uv sync', { cwd, stdio: 'inherit' });
+        } else {
+            if (fs.existsSync(path.join(cwd, 'requirements.txt'))) {
+                execSync('pip install -r requirements.txt', { cwd, stdio: 'inherit' });
+            }
+            if (fs.existsSync(path.join(cwd, 'pyproject.toml'))) {
+                execSync('pip install .', { cwd, stdio: 'inherit' });
+            }
+        }
+    }
+}
+
 function fetchToolsFromRunningServer(command: string, cwd: string): Promise<any[]> {
     return new Promise((resolve, reject) => {
         const [cmd, ...args] = command.split(' ');
 
-        console.log(`[Inspector] Spawning: ${cmd} ${args.join(' ')}`);
-
-        // Use 'shell: true' to support commands like "python -m ..." or chained commands
+        // Spawn with shell:true to handle complex commands
         const serverProcess = spawn(cmd, args, { cwd, env: process.env, shell: true });
 
         let buffer = '';
@@ -153,7 +143,7 @@ function fetchToolsFromRunningServer(command: string, cwd: string): Promise<any[
                 try {
                     const json = JSON.parse(line);
 
-                    // Step 2: Receive Initialize Response
+                    // Handshake Step 2
                     if (json.id === 0 && json.result) {
                         const initNotification = JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n";
                         serverProcess.stdin.write(initNotification);
@@ -163,7 +153,7 @@ function fetchToolsFromRunningServer(command: string, cwd: string): Promise<any[
                         isInitialized = true;
                     }
 
-                    // Step 3: Receive Tools
+                    // Handshake Step 3
                     if (json.id === 1 && json.result && json.result.tools) {
                         resolve(json.result.tools);
                         serverProcess.kill();
@@ -174,7 +164,7 @@ function fetchToolsFromRunningServer(command: string, cwd: string): Promise<any[
 
         serverProcess.stderr.on('data', (data) => console.error(`[Server Log] ${data}`));
 
-        // Step 1: Send Initialize
+        // Handshake Step 1
         const initRequest = JSON.stringify({
             jsonrpc: "2.0", id: 0, method: "initialize",
             params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "inspector", version: "1.0" } }
@@ -185,6 +175,27 @@ function fetchToolsFromRunningServer(command: string, cwd: string): Promise<any[
             serverProcess.kill();
             reject(new Error("Timeout: Handshake failed (15s)"));
         }, 15000);
+    });
+}
+
+function createZipArtifact(sourceDir: string, outPath: string, ignoreList: string[]): Promise<void> {
+    return new Promise((resolve, reject) => {
+        const output = fs.createWriteStream(outPath);
+        const archive = archiver('zip', { zlib: { level: 9 } });
+
+        output.on('close', () => resolve());
+        archive.on('error', (err) => reject(err));
+
+        archive.pipe(output);
+
+        // Glob pattern to match everything EXCEPT ignoreList
+        archive.glob('**/*', {
+            cwd: sourceDir,
+            ignore: ignoreList.map(i => `**/${i}/**`),
+            dot: true
+        });
+
+        archive.finalize();
     });
 }
 
